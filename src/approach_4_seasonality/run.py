@@ -1,6 +1,5 @@
 import pandas as pd
 import numpy as np
-from scipy import signal
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from matplotlib.dates import WeekdayLocator, MO, WE, FR
@@ -31,14 +30,13 @@ def compute_acf(series, max_lag):
 
 def seasonality_strength(ts_values):
     """
-    Measure seasonality strength combining autocorrelation at known lags
-    with spectral concentration from a periodogram.
+    Measure seasonality strength using autocorrelation at known seasonal lags.
 
-    Returns dict with score, best period, per-lag ACF, and spectral ratio.
+    Returns dict with score, best period, and per-lag ACF values.
     """
     n = len(ts_values)
     if n < MIN_ACTIVE_DAYS or np.std(ts_values) < 1e-10:
-        return dict(score=0.0, best_period=None, acf_at_lags={}, spectral_ratio=0.0)
+        return dict(score=0.0, best_period=None, acf_at_lags={})
 
     max_lag = min(n // 2, max(CANDIDATE_PERIODS) + 5)
     acf = compute_acf(ts_values, max_lag)
@@ -51,23 +49,8 @@ def seasonality_strength(ts_values):
     best_period = max(acf_at_lags, key=acf_at_lags.get) if acf_at_lags else None
     best_acf = acf_at_lags[best_period] if best_period else 0.0
 
-    freqs, psd = signal.periodogram(ts_values - np.mean(ts_values))
-    total_power = np.sum(psd)
-
-    if total_power < 1e-10:
-        return dict(score=0.0, best_period=best_period, acf_at_lags=acf_at_lags, spectral_ratio=0.0)
-
-    best_spectral = 0.0
-    window = max(1, len(freqs) // 100)
-    for p in CANDIDATE_PERIODS:
-        target_freq = 1.0 / p
-        idx = np.argmin(np.abs(freqs - target_freq))
-        lo, hi = max(0, idx - window), min(len(freqs), idx + window + 1)
-        ratio = np.sum(psd[lo:hi]) / total_power
-        best_spectral = max(best_spectral, ratio)
-
-    score = 0.6 * max(best_acf, 0) + 0.4 * best_spectral
-    return dict(score=score, best_period=best_period, acf_at_lags=acf_at_lags, spectral_ratio=best_spectral)
+    score = max(best_acf, 0)
+    return dict(score=score, best_period=best_period, acf_at_lags=acf_at_lags)
 
 
 def main():
@@ -107,7 +90,6 @@ def main():
             'seasonality_score': res['score'],
             'best_period_days': res['best_period'],
             'best_acf': max(res['acf_at_lags'].values(), default=0),
-            'spectral_ratio': res['spectral_ratio'],
             'acf_7': res['acf_at_lags'].get(7, 0),
             'acf_14': res['acf_at_lags'].get(14, 0),
             'acf_30': res['acf_at_lags'].get(30, 0),

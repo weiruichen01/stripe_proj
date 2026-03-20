@@ -16,16 +16,23 @@ We load the same two data sources as the other approaches (`dstakehome_merchants
 
 1. **Filter to non-subscribers** — only merchants with `subscription_volume == 0` (the target audience for upselling).
 2. **Require ≥ 30 active days** — seasonality detection needs enough data points; merchants with only a handful of transactions don't provide a meaningful signal. This yields **6,694 merchants** for analysis.
-3. **Build a gap-filled daily time series** — for each merchant, we take their per-day Checkout + Payment Link volumes and reindex onto the full calendar date range (min to max date across the dataset), filling gaps with 0. This is critical because real transaction data has missing days (weekends, holidays, slow periods), and both autocorrelation and FFT assume evenly-spaced observations.
+3. **Build a gap-filled daily time series** — for each merchant, we take their per-day Checkout + Payment Link volumes and reindex onto the full calendar date range (min to max date across the dataset), filling gaps with 0. This is critical because real transaction data has missing days (weekends, holidays, slow periods), and autocorrelation assumes evenly-spaced observations.
 
 ### Step 2: Autocorrelation Analysis (ACF)
 
 The **autocorrelation function** measures how correlated a time series is with a lagged copy of itself. If a merchant's volume on day *t* tends to look similar to their volume on day *t − 7*, the ACF at lag 7 will be high — indicating a weekly cycle.
 
 **How we compute it:**
-- Center the series (subtract the mean), then compute the normalized cross-correlation of the series with itself using `numpy.correlate`.
-- Evaluate the ACF at five canonical seasonal lags: **7** (weekly), **14** (biweekly), **30** (monthly), **60** (bimonthly), and **91** (quarterly).
-- The maximum ACF value across those lags becomes `best_acf`, and the corresponding lag becomes `best_period_days`.
+
+1. **Compute the raw ACF** (`compute_acf`):
+   - Center the series by subtracting the mean.
+   - Compute the full cross-correlation of the series with itself using `numpy.correlate(centered, centered, mode='full')`, which returns a symmetric array of length *2n − 1*.
+   - Slice out the non-negative lags: `full[n-1 : n+max_lag]` gives lags 0 through `max_lag`.
+   - Normalize by dividing by `var × n`, so the ACF at lag 0 equals 1.0 and all other values fall in [−1, 1].
+
+2. **Sample at candidate lags**: The ACF is evaluated at five canonical seasonal lags — **7** (weekly), **14** (biweekly), **30** (monthly), **60** (bimonthly), and **91** (quarterly) — stored in the `acf_at_lags` dictionary.
+
+3. **Select the best**: `best_period` is the candidate lag with the highest ACF value (`max(acf_at_lags, key=acf_at_lags.get)`). `best_acf` is that maximum value — it answers *"at the strongest seasonal cadence, how correlated is this merchant's volume with its own value one cycle ago?"*
 
 **How to read the ACF plots:**
 - The x-axis is the lag in days; the y-axis is the autocorrelation coefficient (−1 to +1).
@@ -33,47 +40,27 @@ The **autocorrelation function** measures how correlated a time series is with a
 - The dashed horizontal grey lines show the **95 % confidence bound** (`±1.96 / √n`). Bars exceeding this bound are statistically significant.
 - Red dashed vertical lines mark the five candidate lags (W = weekly, 2W = biweekly, M = monthly, 2M = bimonthly, Q = quarterly) for quick visual reference.
 
-### Step 3: Spectral Analysis (Periodogram)
+### Step 3: Scoring
 
-The ACF tells us *whether* a lag is correlated, but the **periodogram** tells us *how much energy* in the signal is concentrated at each frequency. It decomposes the time series into its constituent sinusoidal components via the Fast Fourier Transform (FFT).
-
-**How we compute it:**
-- Mean-subtract the series and pass it to `scipy.signal.periodogram`, which returns a power spectral density (PSD) array indexed by frequency.
-- For each candidate period *p*, we find the frequency bin closest to *1/p* and sum the PSD in a small window around it.
-- The **spectral ratio** is the proportion of total signal power captured by the strongest candidate frequency. A high spectral ratio means the signal is dominated by one clean periodic component rather than noise.
-
-**How to read the periodogram plots:**
-- The x-axis is **period in days** (not frequency — we invert for readability); the y-axis is power spectral density.
-- A sharp spike at period = 7 means the signal has a strong 7-day oscillation.
-- Red dashed vertical lines mark the candidate periods. If a spike aligns with one of these lines, the merchant has a clear seasonal pattern at that cadence.
-
-### Step 4: Composite Scoring
-
-Each merchant gets a single `seasonality_score` that blends both signals:
+Each merchant's `seasonality_score` is based purely on autocorrelation:
 
 ```
-seasonality_score = 0.6 × max(best_acf, 0) + 0.4 × spectral_ratio
+seasonality_score = max(best_acf, 0)
 ```
 
-| Component | Weight | What it captures |
-|-----------|--------|------------------|
-| `best_acf` | 60 % | Strength of the strongest lag-to-lag correlation. Directly answers "does this merchant's volume repeat on a fixed schedule?" Clamped to ≥ 0 so negative autocorrelation (anti-seasonal) doesn't deflate the score. |
-| `spectral_ratio` | 40 % | Concentration of signal power at a seasonal frequency. Rewards merchants whose signal is a clean periodic wave rather than broadband noise. |
+The score is the highest ACF value across the five candidate lags, clamped to ≥ 0 so that negative autocorrelation (anti-seasonal patterns) does not produce a positive score. This directly answers "does this merchant's volume repeat on a fixed schedule?" — the higher the score, the stronger the recurring pattern. Merchants are ranked by this score to identify the best Subscriptions upsell candidates.
 
-The 60/40 weighting favors autocorrelation because it is more robust to non-sinusoidal patterns (e.g., sharp weekly spikes followed by flat valleys), while the spectral ratio acts as a confirming signal that guards against spurious ACF peaks caused by trend or drift.
-
-### Step 5: Output
+### Step 4: Output
 
 The top 500 merchants by `seasonality_score` are written to `results.csv`. Each row includes:
 
 | Column | Description |
 |--------|-------------|
 | `merchant` … `active_days` | Standard merchant attributes (same schema as other approaches) |
-| `seasonality_score` | Composite score (0–1 range in practice) |
+| `seasonality_score` | ACF-based score (0–1 range in practice) |
 | `best_period_days` | The candidate lag with the highest ACF (7, 14, 30, 60, or 91) |
 | `cycle_type` | Human-readable label: weekly / biweekly / monthly / bimonthly / quarterly |
 | `best_acf` | The highest ACF value across the five candidate lags |
-| `spectral_ratio` | Fraction of total spectral power at the dominant seasonal frequency |
 | `acf_7` … `acf_91` | Raw ACF values at each of the five candidate lags (useful for secondary analysis) |
 
 ---
@@ -86,10 +73,9 @@ All plots are saved to the `plots/` subdirectory.
 A 10-row × 2-column grid showing the **top 10 merchants** by seasonality score. Left column: daily volume (blue) with a rolling average smoothed over one full period (red). Right column: ACF bar chart. This gives a quick side-by-side overview — you can immediately see which merchants have crisp repeating patterns vs. noisy ones.
 
 ### `merchant_N_detail.png` (N = 1–5)
-Three-panel deep-dive for each of the **top 5 merchants**:
+Two-panel deep-dive for each of the **top 5 merchants**:
 1. **Time series** — raw daily volume overlaid with a rolling average at the detected period length. Lets you visually confirm the recurring spikes.
 2. **ACF** — bar chart with seasonal reference lags highlighted in red. The repeating pattern of tall bars at regular intervals is the hallmark of true seasonality.
-3. **Periodogram** — power spectral density plotted against period (days). A sharp peak at the detected period confirms the frequency-domain evidence.
 
 ### `cycle_distribution.png`
 Bar chart showing how many merchants (among all those with score > 0.1) fall into each cycle type. Useful for understanding the macro distribution of seasonal behaviors in the merchant base.
@@ -128,7 +114,7 @@ The long right tail suggests a small number of merchants with very strong, textb
 | 4 | `83a4aec9` | Business services | ES | Weekly | 0.634 | 0.820 |
 | 5 | `01f9bf03` | Digital goods | US | Weekly | 0.628 | 0.925 |
 
-The top-ranked merchant (`7e0cec36`) is a small Food & drink business in GB with an ACF of 0.88 at lag 7 — meaning each week's volume is 88 % correlated with the prior week's. Its periodogram shows a sharp, dominant spike at exactly 7 days with negligible power elsewhere. This is a near-perfect weekly recurring pattern, strongly suggesting this merchant's customers are buying on a weekly schedule that Subscriptions could automate.
+The top-ranked merchant (`7e0cec36`) is a small Food & drink business in GB with an ACF of 0.88 at lag 7 — meaning each week's volume is 88 % correlated with the prior week's. This is a near-perfect weekly recurring pattern, strongly suggesting this merchant's customers are buying on a weekly schedule that Subscriptions could automate.
 
 Notably, Food & drink dominates the top ranks, which makes intuitive sense — restaurants, cafés, and meal-prep services naturally serve repeat customers on a weekly cadence. Business services and Digital goods also appear, likely reflecting recurring consulting engagements or digital membership purchases.
 
@@ -157,4 +143,4 @@ cd src/approach_4_seasonality
 python run.py
 ```
 
-Runtime: ~7 minutes on a modern laptop (dominated by per-merchant FFT and ACF computation across 6,694 merchants). Outputs `results.csv` and all plots to `plots/`.
+Runtime: ~7 minutes on a modern laptop (dominated by per-merchant ACF computation across 6,694 merchants). Outputs `results.csv` and all plots to `plots/`.
