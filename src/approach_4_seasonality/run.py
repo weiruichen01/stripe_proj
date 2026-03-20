@@ -179,7 +179,7 @@ def plot_top_seasonal(payments, scored, date_range, n=10):
         combined = m_ts['checkout_volume'] + m_ts['payment_link_volume']
         period = int(row['best_period_days']) if pd.notna(row['best_period_days']) else 7
 
-        fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(14, 10))
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 7))
         fig.suptitle(
             f"Seasonality Deep-Dive: Merchant {mid}  "
             f"({row['cycle_type']}, score={row['seasonality_score']:.3f})",
@@ -198,20 +198,6 @@ def plot_top_seasonal(payments, scored, date_range, n=10):
         # Panel 2 – ACF
         _plot_acf_bar(combined.values, ax2, highlight=True)
         ax2.set_title('Autocorrelation Function (red bars = seasonal reference lags)')
-
-        # Panel 3 – periodogram
-        freqs, psd = signal.periodogram(combined.values - combined.mean())
-        periods_arr = np.zeros_like(freqs)
-        periods_arr[1:] = 1.0 / freqs[1:]
-        mask = (periods_arr >= 3) & (periods_arr <= 120)
-        ax3.plot(periods_arr[mask], psd[mask], color='#6366f1', lw=1.0)
-        ax3.set_xlabel('Period (days)')
-        ax3.set_ylabel('Power Spectral Density')
-        ax3.set_title('Periodogram')
-        for p, label in PERIOD_LABELS.items():
-            ax3.axvline(x=p, color='#dc2626', ls='--', alpha=0.4)
-            ax3.text(p, ax3.get_ylim()[1] * 0.9, label.capitalize(),
-                     ha='center', fontsize=8, color='#dc2626', rotation=45)
 
         plt.tight_layout()
         fig.savefig(f'plots/merchant_{rank}_detail.png', dpi=150, bbox_inches='tight')
@@ -242,6 +228,7 @@ _DOW_LABEL = {0: 'M', 2: 'W', 4: 'F'}
 
 def _setup_weekday_axis(ax, date_range):
     """Configure x-axis with M/W/F tick marks and start/end date labels only."""
+    ax.set_xlim(date_range[0], date_range[-1])
     ax.xaxis.set_major_locator(WeekdayLocator(byweekday=[MO, WE, FR]))
     ax.xaxis.set_major_formatter(FuncFormatter(
         lambda x, _: _DOW_LABEL.get(mdates.num2date(x).weekday(), '')))
