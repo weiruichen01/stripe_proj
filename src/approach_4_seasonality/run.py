@@ -12,6 +12,8 @@ warnings.filterwarnings('ignore')
 CANDIDATE_PERIODS = [7, 14, 30, 60, 91]
 PERIOD_LABELS = {7: 'weekly', 14: 'biweekly', 30: 'monthly', 60: 'bimonthly', 91: 'quarterly'}
 MIN_ACTIVE_DAYS = 30
+MIN_NONZERO_DENSITY = 0.20  # at least 20% of days in active window must have volume
+MIN_ACTIVE_WINDOW_DAYS = 30  # active window (first→last payment) must span 30+ days
 
 
 def compute_acf(series, max_lag):
@@ -28,18 +30,36 @@ def compute_acf(series, max_lag):
     return acf
 
 
+def trim_to_active_window(ts_values):
+    """Trim series to the span between first and last non-zero day."""
+    nonzero_idx = np.nonzero(ts_values)[0]
+    if len(nonzero_idx) == 0:
+        return ts_values, 0, len(ts_values)
+    first, last = nonzero_idx[0], nonzero_idx[-1]
+    return ts_values[first:last + 1], first, last
+
+
 def seasonality_strength(ts_values):
     """
     Measure seasonality strength using autocorrelation at known seasonal lags.
 
-    Returns dict with score, best period, and per-lag ACF values.
+    Trims the series to the active window and filters out merchants whose
+    active window is too short or too sparse (dominated by zeros).
     """
-    n = len(ts_values)
-    if n < MIN_ACTIVE_DAYS or np.std(ts_values) < 1e-10:
-        return dict(score=0.0, best_period=None, acf_at_lags={})
+    trimmed, start, end = trim_to_active_window(ts_values)
+    n = len(trimmed)
+    if n < MIN_ACTIVE_WINDOW_DAYS:
+        return dict(score=0.0, best_period=None, acf_at_lags={}, skipped='window_too_short')
+
+    nonzero_density = np.count_nonzero(trimmed) / n
+    if nonzero_density < MIN_NONZERO_DENSITY:
+        return dict(score=0.0, best_period=None, acf_at_lags={}, skipped='too_sparse')
+
+    if np.std(trimmed) < 1e-10:
+        return dict(score=0.0, best_period=None, acf_at_lags={}, skipped='no_variance')
 
     max_lag = min(n // 2, max(CANDIDATE_PERIODS) + 5)
-    acf = compute_acf(ts_values, max_lag)
+    acf = compute_acf(trimmed, max_lag)
 
     acf_at_lags = {}
     for p in CANDIDATE_PERIODS:
@@ -50,7 +70,8 @@ def seasonality_strength(ts_values):
     best_acf = acf_at_lags[best_period] if best_period else 0.0
 
     score = max(best_acf, 0)
-    return dict(score=score, best_period=best_period, acf_at_lags=acf_at_lags)
+    return dict(score=score, best_period=best_period, acf_at_lags=acf_at_lags,
+                active_window_days=n, nonzero_density=nonzero_density, skipped=None)
 
 
 def main():
@@ -77,6 +98,7 @@ def main():
 
     date_range = pd.date_range(payments['date'].min(), payments['date'].max(), freq='D')
     rows = []
+    skip_counts = {'window_too_short': 0, 'too_sparse': 0, 'no_variance': 0}
 
     for i, (_, mrow) in enumerate(non_subs.iterrows()):
         mid = mrow['merchant']
@@ -85,6 +107,9 @@ def main():
         combined = (m_ts['checkout_volume'] + m_ts['payment_link_volume']).values.astype(float)
 
         res = seasonality_strength(combined)
+        if res.get('skipped'):
+            skip_counts[res['skipped']] += 1
+            continue
         rows.append({
             'merchant': mid,
             'seasonality_score': res['score'],
@@ -95,9 +120,17 @@ def main():
             'acf_30': res['acf_at_lags'].get(30, 0),
             'acf_60': res['acf_at_lags'].get(60, 0),
             'acf_91': res['acf_at_lags'].get(91, 0),
+            'active_window_days': res['active_window_days'],
+            'nonzero_density': res['nonzero_density'],
         })
         if (i + 1) % 500 == 0:
             print(f"  Processed {i + 1}/{len(non_subs)} merchants...")
+
+    total_skipped = sum(skip_counts.values())
+    print(f"\nFiltered out {total_skipped} merchants:")
+    for reason, count in skip_counts.items():
+        if count > 0:
+            print(f"  - {reason}: {count}")
 
     results_df = pd.DataFrame(rows)
     scored = pd.merge(non_subs, results_df, on='merchant', how='inner')
@@ -131,20 +164,20 @@ def plot_top_seasonal(payments, scored, date_range, n=10):
 
     for idx, (_, row) in enumerate(top.iterrows()):
         mid = row['merchant']
-        m_ts = _merchant_ts(payments, mid, date_range)
+        m_ts, m_range = _merchant_ts(payments, mid, date_range)
         combined = m_ts['checkout_volume'] + m_ts['payment_link_volume']
 
         period = int(row['best_period_days']) if pd.notna(row['best_period_days']) else 7
         rolling = combined.rolling(window=period, center=True).mean()
 
         ax_ts = axes[idx, 0]
-        ax_ts.plot(date_range, combined.values, lw=0.8, color='#2563eb', alpha=0.6)
-        ax_ts.plot(date_range, rolling.values, lw=2, color='#dc2626', alpha=0.85)
+        ax_ts.plot(m_range, combined.values, lw=0.8, color='#2563eb', alpha=0.6)
+        ax_ts.plot(m_range, rolling.values, lw=2, color='#dc2626', alpha=0.85)
         ax_ts.set_title(
             f"Merchant {mid}  |  {row['cycle_type']} ({period}d)  |  "
             f"score {row['seasonality_score']:.3f}", fontsize=10)
         ax_ts.set_ylabel('Volume (cents)')
-        _setup_weekday_axis(ax_ts, date_range)
+        _setup_weekday_axis(ax_ts, m_range)
 
         ax_acf = axes[idx, 1]
         _plot_acf_bar(combined.values, ax_acf)
@@ -157,7 +190,7 @@ def plot_top_seasonal(payments, scored, date_range, n=10):
     # ---- Detailed 3-panel plots for top 5 ----
     for rank, (_, row) in enumerate(top.head(5).iterrows(), start=1):
         mid = row['merchant']
-        m_ts = _merchant_ts(payments, mid, date_range)
+        m_ts, m_range = _merchant_ts(payments, mid, date_range)
         combined = m_ts['checkout_volume'] + m_ts['payment_link_volume']
         period = int(row['best_period_days']) if pd.notna(row['best_period_days']) else 7
 
@@ -168,13 +201,13 @@ def plot_top_seasonal(payments, scored, date_range, n=10):
             fontsize=13, fontweight='bold')
 
         # Panel 1 – time series
-        ax1.plot(date_range, combined.values, lw=0.7, alpha=0.55, color='#2563eb', label='Daily volume')
+        ax1.plot(m_range, combined.values, lw=0.7, alpha=0.55, color='#2563eb', label='Daily volume')
         rolling = combined.rolling(window=period, center=True).mean()
-        ax1.plot(date_range, rolling.values, lw=2, color='#dc2626',
+        ax1.plot(m_range, rolling.values, lw=2, color='#dc2626',
                  label=f'{period}-day rolling avg')
         ax1.set_ylabel('Volume (cents)')
         ax1.legend(loc='upper right')
-        _setup_weekday_axis(ax1, date_range)
+        _setup_weekday_axis(ax1, m_range)
         ax1.set_title('Non-Subscription Volume (Checkout + Payment Links)')
 
         # Panel 2 – ACF
@@ -226,9 +259,16 @@ def _setup_weekday_axis(ax, date_range):
 
 
 def _merchant_ts(payments, merchant_id, date_range):
-    """Return a daily-reindexed DataFrame for one merchant."""
+    """Return a daily-reindexed DataFrame trimmed to the active window."""
     m = payments[payments['merchant'] == merchant_id][['date', 'checkout_volume', 'payment_link_volume']]
-    return m.set_index('date').reindex(date_range, fill_value=0)
+    full = m.set_index('date').reindex(date_range, fill_value=0)
+    combined = full['checkout_volume'] + full['payment_link_volume']
+    nonzero_idx = combined.to_numpy().nonzero()[0]
+    if len(nonzero_idx) == 0:
+        return full, date_range
+    first, last = nonzero_idx[0], nonzero_idx[-1]
+    trimmed_range = date_range[first:last + 1]
+    return full.iloc[first:last + 1], trimmed_range
 
 
 def _plot_acf_bar(values, ax, highlight=False):

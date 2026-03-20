@@ -2,7 +2,7 @@
 
 ## Approach
 
-I used time series analysis to find non-subscriber merchants whose payment volumes repeat on a regular schedule (weekly, biweekly, monthly, etc.). If a merchant's customers are already paying on a predictable cycle, Subscriptions is a natural next step to automate what's already happening.
+I used time series analysis to find merchants whose payment volumes repeat on a regular schedule (weekly, biweekly, monthly, etc.). If a merchant's customers are already paying on a predictable cycle, Subscriptions is a natural next step to automate what's already happening.
 
 ## Data Preparation
 
@@ -24,11 +24,11 @@ The seasonality score is the highest ACF value across the five candidate lags. A
 
 | Cycle     | Count | Share |
 |-----------|-------|-------|
-| Weekly    | 372   | 74%   |
-| Biweekly  | 95    | 19%   |
-| Monthly   | 21    | 4%    |
-| Quarterly | 8     | 2%    |
-| Bimonthly | 4     | 1%    |
+| Weekly    | 335   | 67%   |
+| Biweekly  | 112   | 22%   |
+| Monthly   | 26    | 5%    |
+| Quarterly | 19    | 4%    |
+| Bimonthly | 8     | 2%    |
 
 ### Which merchants to target
 
@@ -38,11 +38,11 @@ Starting from the candidates with the highest scores. These have very clear repe
 
 - **Visual validation.** I plotted top merchant candidates (time series, ACF) and confirmed the detected patterns are real.
 
-- **Statistical significance.** ACF values exceed the 95% confidence bound (±1.96/√n).
+- **Statistical significance.** ACF values exceed the 95% confidence bound.
 
 ## Recommendation for Stripe
 
-1. **Sales prioritization.** Use the ranked list to prioritize outreach. These are low-hanging fruit.
+1. **Sales prioritization.** Use the ranked list to prioritize outreach.
 2. **In-product integration.** Surface the detected cycle in the Stripe Dashboard ("Your customers tend to pay every week. Set up a subscription to automate this.") as a contextual upsell prompt.
 3. **Segment by cycle type.** For a more precise promotion, tailor the Subscriptions pitch to the detected cadence: weekly merchants hear about a success story of weekly billing plans; monthly merchants hear about a success story of monthly billing plans. If time and resources permit, an industry-oriented or a nearest neighbor (via clustering) success story can be used to target the merchant.
 
